@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Bili.Dynamic.AutoDel Pro (修复删除问题版)
+// @name         Bili.Dynamic.AutoDel
 // @namespace    https://github.com/
-// @version      2024.03.06.04
-// @description  删除B站转发的已开奖动态和源动态已被删除的动态 - 修复删除功能，简化逻辑，失败重试
+// @version      2025.12.16
+// @description  删除B站转发的已开奖动态和源动态已被删除的动态
 // @author       monSteRhhe
 // @match        http*://*.bilibili.com/*
 // @icon         https://www.bilibili.com/favicon.ico
