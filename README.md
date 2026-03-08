@@ -1,7 +1,5 @@
 <div align="center"><img src="https://socialify.git.ci/monSteRhhe/bilibili-dynamic-del/image?font=Inter&language=1&name=1&pattern=Plus&stargazers=1&theme=Light"/></div>
 
-**已经看到了大伙的反馈，最近这段时间来总是忙于各种事情，等做好了安排开始着手一些修改**
-
 ## 功能
 
 1. 自动删除B站 **已开奖的转发抽奖** 动态和 **源动态已被删除** 的动态；
@@ -12,7 +10,7 @@
 
 4. 删除动态并取关用户
 
-5. **新增功能** (版本 2025.12.16):
+5. **新增功能** 
    - 实时进度面板，显示处理状态、统计信息和详细日志
    - 增强的错误处理和自动重试机制
    - 导出详细执行报告功能
