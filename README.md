@@ -6,7 +6,7 @@
 
 2. 自主选择删除转发的 **某个用户动态** 的转发动态；
 
-3. 删除 **X天及之前** 发布的源动态的转发动态。
+3. 按**转发动态的发布日期**，删除 **X天及之前** 的转发动态；未开奖的互动抽奖仍会保留。
 
 4. 删除动态并取关用户
 
@@ -32,7 +32,7 @@
 
 2. **指定用户**：点击后在弹出窗口输入用户名或者该用户的数字UID并确定，能够删除源动态的作者是该用户的转发动态。
 
-3. **删除X天前的转发动态**：点击后在弹出窗口输入往前的天数，**转发动态在这天以及之前的日期发布的动态会被删除**。([issue #3](https://github.com/monSteRhhe/bilibili-dynamic-del/issues/3)) 输入为空时继续操作的问题已解决，时间间隔还没整。([issue #6](https://github.com/monSteRhhe/bilibili-dynamic-del/issues/6))
+3. **删除X天前的转发动态**：点击后在弹出窗口输入完整正整数，筛选**在这天及之前发布的转发动态**。未开奖或正在开奖的互动抽奖会保留，抽奖状态查询失败或转发日期无效时跳过。([issue #3](https://github.com/monSteRhhe/bilibili-dynamic-del/issues/3)) 删除和取关请求按队列执行，间隔至少3秒。
 
 4. **打开设置**：点击后弹出设置窗口，如下图：
 
@@ -79,3 +79,14 @@
 ​    
 
 更多好用的可见：[awesome-bilibili-extra](https://github.com/HCLonely/awesome-bilibili-extra)
+
+### 本地验证
+
+安装 Node.js 后，在项目目录运行：
+
+```sh
+node --check bili-dynamic-autodel.user.js
+node tests/userscript.test.cjs
+```
+
+测试使用模拟接口和DOM，不访问B站，也不会实际删除动态或取关。安装时将本地 `bili-dynamic-autodel.user.js` 的完整内容替换到脚本管理器中保存，再刷新B站页面。

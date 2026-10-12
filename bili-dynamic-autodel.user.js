@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站动态自动清理
 // @namespace    https://github.com/
-// @version      2026.3.8
+// @version      2026.10.12
 // @description  删除B站转发的已开奖动态和源动态已被删除的动态
 // @author       monSteRhhe
 // @match        http*://*.bilibili.com/*
@@ -14,6 +14,7 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_download
 // @run-at       document-end
+// @noframes
 // @require      https://unpkg.com/axios/dist/axios.min.js
 // ==/UserScript==
 /* globals axios */
@@ -40,14 +41,22 @@
         MAX_RETRIES: 2,
         BATCH_SIZE: 5,
         PAUSE_CHECK_INTERVAL: 1000,
-        MEMORY_CLEANUP_INTERVAL: 10,
-        LOTTERY_API_TIMEOUT: 8000
+        LOTTERY_API_TIMEOUT: 8000,
+        MAX_VISIBLE_LOGS: 200,
+        MAX_STORED_LOGS: 1000,
+        MAX_LOTTERY_CACHE: 500
     };
 
     // ========== 执行状态管理 ==========
     let isRunning = false;
     let isPaused = false;
-    let retryCounts = {};
+    let runController = null;
+    let mutationQueue = Promise.resolve();
+    let lastMutationTime = 0;
+    let progressTimer = null;
+    let runFailure = null;
+    const lotteryCache = new Map();
+    const seenDynamics = new Set();
     let menuCommandsRegistered = false;
     let progressData = {
         currentPage: 0,
@@ -59,6 +68,8 @@
         startTime: null,
         endTime: null,
         deletedDetails: [],
+        unfollowedDetails: [],
+        unfollowFailedDetails: [],
         logs: []
     };
 
@@ -66,11 +77,8 @@
 
     // 获取抽奖API重试次数
     function getLotteryApiRetries() {
-        const retries = GM_getValue('lottery-api-retries');
-        if (retries === undefined) {
-            return 2;
-        }
-        return parseInt(retries, 10);
+        const retries = Number(GM_getValue('lottery-api-retries', 2));
+        return Number.isInteger(retries) && retries >= 0 && retries <= 5 ? retries : 2;
     }
 
     function initSettings() {
@@ -112,31 +120,6 @@
         return match ? match[2] : null;
     }
 
-    function mapDynamicType(dynamicType) {
-        const typeMap = {
-            'DYNAMIC_TYPE_FORWARD': 1,
-            'DYNAMIC_TYPE_AV': 8,
-            'DYNAMIC_TYPE_DRAW': 2,
-            'DYNAMIC_TYPE_WORD': 4,
-            'DYNAMIC_TYPE_ARTICLE': 64,
-            'DYNAMIC_TYPE_MUSIC': 256,
-            'DYNAMIC_TYPE_LIVE_RCMD': 2048,
-            2: 1,
-            4: 8,
-            8: 64,
-            64: 4,
-            2048: 2048,
-            4097: 1
-        };
-
-        // 如果是字符串类型的转发，直接返回1
-        if (dynamicType === 'DYNAMIC_TYPE_FORWARD' || dynamicType === 'FORWARD') {
-            return 1;
-        }
-
-        return typeMap[dynamicType] || 1;
-    }
-
     function getBeforeDate(num) {
         let d = new Date();
         d.setDate(d.getDate() - num);
@@ -162,7 +145,116 @@
     }
 
     function sleep(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
+        const signal = runController?.signal;
+        return new Promise(resolve => {
+            if (signal?.aborted) return resolve();
+            const finish = () => {
+                clearTimeout(timer);
+                signal?.removeEventListener('abort', finish);
+                resolve();
+            };
+            const timer = setTimeout(finish, ms);
+            signal?.addEventListener('abort', finish, { once: true });
+        });
+    }
+
+    function isTaskActive() {
+        return isRunning && !runController?.signal.aborted;
+    }
+
+    async function waitUntilReady() {
+        while (isPaused && isTaskActive()) await sleep(CONFIG.PAUSE_CHECK_INTERVAL);
+        return isTaskActive();
+    }
+
+    function cancellationError() {
+        const error = new Error('任务已停止');
+        error.code = 'ERR_CANCELED';
+        return error;
+    }
+
+    function isCancellation(error) {
+        return error?.code === 'ERR_CANCELED' || error?.name === 'AbortError';
+    }
+
+    // 查询可并发；删除和取关共用队列，限制实际写请求之间的间隔。
+    async function apiRequest(config, mutation = false) {
+        const execute = async () => {
+            if (mutation) await sleep(Math.max(0, CONFIG.REQUEST_DELAY - (Date.now() - lastMutationTime)));
+            if (!await waitUntilReady()) throw cancellationError();
+            if (mutation) lastMutationTime = Date.now();
+            const response = await axios({
+                timeout: 10000,
+                withCredentials: true,
+                ...config,
+                signal: runController.signal
+            });
+            const body = response.data;
+            if (!body || !['number', 'string'].includes(typeof body.code) || String(body.code).trim() === '') {
+                throw new Error('API响应格式无效');
+            }
+            const code = Number(body.code);
+            if ([-101, -111, -403].includes(code)) {
+                const error = new Error(`登录或CSRF校验失败: ${body.message || code}`);
+                error.fatal = true;
+                runFailure = error;
+                runController.abort();
+                throw error;
+            }
+            return body;
+        };
+        if (!mutation) return execute();
+        const pending = mutationQueue.then(execute);
+        mutationQueue = pending.catch(() => {});
+        return pending;
+    }
+
+    function apiError(body) {
+        const error = new Error(`API返回错误: ${body.message || '未知错误'} (code: ${body.code})`);
+        error.apiCode = Number(body.code);
+        return error;
+    }
+
+    function canRetry(error) {
+        if (isCancellation(error) || error.fatal) return false;
+        if (error.apiCode !== undefined) return [-352, -500, 4128002].includes(error.apiCode);
+        const status = error.response?.status;
+        return status ? status === 408 || status === 429 || status >= 500 :
+            ['ECONNABORTED', 'ETIMEDOUT', 'ERR_NETWORK'].includes(error.code) || /Network Error|timeout/i.test(error.message);
+    }
+
+    async function requestWithRetry(config, retries = CONFIG.MAX_RETRIES, mutation = false, allowedCodes = [0]) {
+        for (let attempt = 0; ; attempt++) {
+            try {
+                const body = await apiRequest(config, mutation);
+                if (!allowedCodes.includes(Number(body.code))) throw apiError(body);
+                return body;
+            } catch (error) {
+                if (attempt >= retries || !canRetry(error)) {
+                    if ([-352, 4128002].includes(error.apiCode) || [412, 429].includes(error.response?.status)) {
+                        error.fatal = true;
+                        runFailure = error;
+                        runController.abort();
+                    }
+                    throw error;
+                }
+                addProgressLog(`请求失败，${CONFIG.RETRY_DELAY * (attempt + 1) / 1000}秒后重试 (${attempt + 1}/${retries}): ${error.message}`, 'warning');
+                await sleep(CONFIG.RETRY_DELAY * (attempt + 1));
+            }
+        }
+    }
+
+    function getUnfollowList() {
+        const stored = GM_getValue('unfollow-list', []);
+        const users = new Map();
+        if (!Array.isArray(stored)) return [];
+        for (const item of stored) {
+            const uid = String(item && typeof item === 'object' ? item.uid ?? '' : item ?? '');
+            if (/^[1-9]\d*$/.test(uid) && !users.has(uid)) {
+                users.set(uid, { uid, name: String(item?.name || uid) });
+            }
+        }
+        return [...users.values()];
     }
 
     function formatTime(ms) {
@@ -198,210 +290,52 @@
     }
 
     // 获取转发动态日期的函数（带重试机制）
-    async function getForwardDynamicDateWithRetry(data, dynamicId, maxRetries = 3) {
-        let retryCount = 0;
 
-        while (retryCount < maxRetries) {
-            try {
-                let forwardTimestamp = null;
-
-                if (data.modules && data.modules.module_author && data.modules.module_author.pub_ts) {
-                    forwardTimestamp = data.modules.module_author.pub_ts;
-                    console.log(`获取到转发动态日期 (重试 ${retryCount}): 通过 module_author.pub_ts = ${forwardTimestamp}`);
-                } else if (data.modules && data.modules.module_author && data.modules.module_author.pubtime) {
-                    forwardTimestamp = data.modules.module_author.pubtime;
-                    console.log(`获取到转发动态日期 (重试 ${retryCount}): 通过 module_author.pubtime = ${forwardTimestamp}`);
-                } else if (data.pub_ts) {
-                    forwardTimestamp = data.pub_ts;
-                    console.log(`获取到转发动态日期 (重试 ${retryCount}): 通过 data.pub_ts = ${forwardTimestamp}`);
-                } else if (data.pubtime) {
-                    forwardTimestamp = data.pubtime;
-                    console.log(`获取到转发动态日期 (重试 ${retryCount}): 通过 data.pubtime = ${forwardTimestamp}`);
-                } else if (data.ctime) {
-                    forwardTimestamp = data.ctime;
-                    console.log(`获取到转发动态日期 (重试 ${retryCount}): 通过 data.ctime = ${forwardTimestamp}`);
-                } else if (data.timestamp) {
-                    forwardTimestamp = data.timestamp;
-                    console.log(`获取到转发动态日期 (重试 ${retryCount}): 通过 data.timestamp = ${forwardTimestamp}`);
-                }
-
-                if (forwardTimestamp) {
-                    const forwardDate = timestampToDate(forwardTimestamp);
-                    console.log(`动态 ${dynamicId}: 成功获取转发日期 ${forwardDate} (时间戳: ${forwardTimestamp})`);
-                    return {
-                        success: true,
-                        timestamp: forwardTimestamp,
-                        date: forwardDate,
-                        retries: retryCount
-                    };
-                }
-
-                retryCount++;
-                if (retryCount < maxRetries) {
-                    console.log(`动态 ${dynamicId}: 未找到转发日期，${CONFIG.RETRY_DELAY/1000}秒后重试 (${retryCount}/${maxRetries})`);
-                    await sleep(CONFIG.RETRY_DELAY);
-                }
-
-            } catch (error) {
-                retryCount++;
-                console.log(`动态 ${dynamicId}: 获取转发日期时出错: ${error.message} (重试 ${retryCount}/${maxRetries})`);
-                if (retryCount < maxRetries) {
-                    await sleep(CONFIG.RETRY_DELAY);
-                }
-            }
+    // 同一条响应里的字段不会因等待而变化，直接检查所有候选时间戳。
+    function getForwardDynamicDate(data) {
+        const author = data.modules?.module_author;
+        const candidates = [author?.pub_ts, author?.pubtime, data.pub_ts, data.pubtime, data.ctime, data.timestamp];
+        for (const value of candidates) {
+            if (typeof value !== 'number' && !(typeof value === 'string' && /^\d+$/.test(value))) continue;
+            let timestamp = Number(value);
+            if (timestamp > 1e12) timestamp /= 1000;
+            if (!Number.isFinite(timestamp) || timestamp <= 0 || !Number.isFinite(new Date(timestamp * 1000).getTime())) continue;
+            return { success: true, timestamp, date: timestampToDate(timestamp) };
         }
-
-        console.log(`动态 ${dynamicId}: 获取转发日期失败，已达到最大重试次数 ${maxRetries}`);
-        return {
-            success: false,
-            timestamp: null,
-            date: null,
-            retries: retryCount
-        };
+        return { success: false, timestamp: null, date: null };
     }
 
-    // 优化后的抽奖状态检查函数，带重试机制
-    async function checkLotteryStatus(dynamicId, index) {
-        const api = {
-            url: `https://api.vc.bilibili.com/lottery_svr/v1/lottery_svr/lottery_notice?business_type=4&business_id=${dynamicId}`,
-            name: '抽奖API'
-        };
 
-        let retryCount = 0;
-        const maxRetries = getLotteryApiRetries();
-
-        while (retryCount <= maxRetries) {
+    async function checkLotteryStatus(dynamicId) {
+        const key = String(dynamicId);
+        if (lotteryCache.has(key)) return lotteryCache.get(key);
+        const pending = (async () => {
             try {
-                console.log(`抽奖API请求 (重试 ${retryCount}/${maxRetries}): ${api.url}`);
-
-                const response = await axios({
-                    url: api.url,
-                    timeout: CONFIG.LOTTERY_API_TIMEOUT,
-                    headers: {
-                        'User-Agent': navigator.userAgent,
-                        'Referer': 'https://www.bilibili.com/',
-                        'Origin': 'https://www.bilibili.com'
-                    },
-                    withCredentials: true
-                });
-
-                console.log(`抽奖API响应 (${dynamicId}, 重试 ${retryCount}):`, {
-                    code: response.data.code,
-                    message: response.data.message,
-                    data: response.data.data
-                });
-
-                if (response.data.code === 0) {
-                    if (response.data.data) {
-                        let status = response.data.data.status;
-                        let isLottery = true;
-
-                        if (status === null || status === undefined) {
-                            isLottery = false;
-                            status = '非抽奖';
-                        }
-
-                        return {
-                            success: true,
-                            apiUsed: api.name,
-                            isLottery: isLottery,
-                            status: status,
-                            rawData: response.data.data,
-                            retries: retryCount
-                        };
-                    } else {
-                        return {
-                            success: true,
-                            apiUsed: api.name,
-                            isLottery: false,
-                            status: '非抽奖',
-                            rawData: null,
-                            retries: retryCount
-                        };
-                    }
-                } else if (response.data.code === -400) {
-                    return {
-                        success: true,
-                        apiUsed: api.name,
-                        isLottery: false,
-                        status: '非抽奖',
-                        rawData: null,
-                        retries: retryCount
-                    };
-                } else if (response.data.code === -9999) {
-                    return {
-                        success: true,
-                        apiUsed: api.name,
-                        isLottery: false,
-                        status: '非抽奖',
-                        rawData: null,
-                        retries: retryCount
-                    };
-                } else {
-                    console.log(`抽奖API返回错误: code=${response.data.code}, msg=${response.data.message}`);
-                    throw new Error(`API返回错误码: ${response.data.code}`);
-                }
+                const body = await requestWithRetry({
+                    url: 'https://api.vc.bilibili.com/lottery_svr/v1/lottery_svr/lottery_notice',
+                    params: { business_type: 4, business_id: key },
+                    timeout: CONFIG.LOTTERY_API_TIMEOUT
+                }, getLotteryApiRetries(), false, [0, -400, -9999]);
+                const value = body.data?.status;
+                const isLottery = Number(body.code) === 0 && value !== null && value !== undefined;
+                const status = isLottery ? Number(value) : null;
+                if (isLottery && (String(value).trim() === '' || !Number.isFinite(status))) throw new Error('抽奖状态格式无效');
+                return { success: true, isLottery, status };
             } catch (error) {
-                console.log(`抽奖API请求失败 (重试 ${retryCount}/${maxRetries}):`, error.message);
-
-                if (retryCount >= maxRetries) {
-                    console.log(`抽奖API已达到最大重试次数 (${maxRetries})，放弃重试`);
-
-                    let errorType = '未知错误';
-                    let errorCode = 'UNKNOWN';
-
-                    if (error.response) {
-                        errorType = `HTTP ${error.response.status} 错误`;
-                        errorCode = `HTTP_${error.response.status}`;
-                    } else if (error.code === 'ECONNABORTED') {
-                        errorType = '请求超时';
-                        errorCode = 'TIMEOUT';
-                    } else if (error.message.includes('Network Error')) {
-                        errorType = '网络错误';
-                        errorCode = 'NETWORK_ERROR';
-                    } else if (error.message.includes('API返回错误码')) {
-                        errorType = error.message;
-                        errorCode = error.message.match(/错误码:\s*(\S+)/)?.[1] || 'API_ERROR';
-                    }
-
-                    return {
-                        success: false,
-                        apiUsed: api.name,
-                        isLottery: null,
-                        status: '查询失败',
-                        rawData: null,
-                        retries: retryCount,
-                        error: {
-                            type: errorType,
-                            code: errorCode,
-                            message: error.message
-                        }
-                    };
-                }
-
-                retryCount++;
-                if (retryCount <= maxRetries) {
-                    const delay = CONFIG.RETRY_DELAY * retryCount;
-                    console.log(`等待 ${delay/1000} 秒后重试 (${retryCount}/${maxRetries})`);
-                    await sleep(delay);
-                }
+                if (isCancellation(error) || error.fatal) throw error;
+                return { success: false, error: { code: error.apiCode ?? error.code ?? 'UNKNOWN', message: error.message } };
             }
+        })();
+        lotteryCache.set(key, pending);
+        if (lotteryCache.size > CONFIG.MAX_LOTTERY_CACHE) lotteryCache.delete(lotteryCache.keys().next().value);
+        try {
+            const result = await pending;
+            if (!result.success) lotteryCache.delete(key);
+            return result;
+        } catch (error) {
+            lotteryCache.delete(key);
+            throw error;
         }
-
-        console.log(`抽奖API完全失败 for ${dynamicId}`);
-        return {
-            success: false,
-            apiUsed: api.name,
-            isLottery: null,
-            status: '查询失败',
-            rawData: null,
-            retries: retryCount,
-            error: {
-                type: '最大重试次数耗尽',
-                code: 'MAX_RETRIES_EXCEEDED',
-                message: '已达到最大重试次数'
-            }
-        };
     }
 
     // ========== 样式管理 ==========
@@ -1009,6 +943,7 @@
     }
 
     function togglePause() {
+        if (!isTaskActive()) return;
         isPaused = !isPaused;
         progressData.currentStatus = isPaused ? '已暂停' : '正在运行';
         updateProgressDisplay();
@@ -1049,40 +984,34 @@
 
         const timeEl = document.getElementById('progress-time');
         if (timeEl && progressData.startTime) {
-            const elapsed = Date.now() - progressData.startTime;
+            const elapsed = (progressData.endTime || Date.now()) - progressData.startTime;
             timeEl.textContent = `运行时间: ${formatTime(elapsed)}`;
         }
     }
 
+
     function addProgressLog(message, type = 'info', dynamicId = null) {
+        const now = new Date();
         const logsContainer = document.getElementById('progress-logs');
         if (logsContainer) {
+            const shouldScroll = logsContainer.scrollHeight - logsContainer.scrollTop - logsContainer.clientHeight < 40;
             const logItem = document.createElement('div');
             logItem.className = `log-item ${type}`;
-
-            const now = new Date();
-            const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
-
-            let logMessage = message;
-            if (dynamicId) {
-                logMessage = `[动态ID: ${dynamicId}] ${message}`;
-            }
-
-            logItem.innerHTML = `
-                <span class="log-time">${timeStr}</span>
-                <span class="log-message">${logMessage}</span>
-            `;
-
+            const time = document.createElement('span');
+            time.className = 'log-time';
+            time.textContent = now.toLocaleTimeString();
+            const text = document.createElement('span');
+            text.className = 'log-message';
+            text.textContent = dynamicId ? `[动态ID: ${dynamicId}] ${message}` : String(message);
+            logItem.append(time, text);
             logsContainer.appendChild(logItem);
-            logsContainer.scrollTop = logsContainer.scrollHeight;
+            while (logsContainer.children.length > CONFIG.MAX_VISIBLE_LOGS) logsContainer.firstElementChild.remove();
+            if (shouldScroll) logsContainer.scrollTop = logsContainer.scrollHeight;
         }
-
-        progressData.logs.push({
-            timestamp: new Date(),
-            message: message,
-            type: type,
-            dynamicId: dynamicId
-        });
+        progressData.logs.push({ timestamp: now, message, type, dynamicId });
+        if (progressData.logs.length > CONFIG.MAX_STORED_LOGS) {
+            progressData.logs.splice(0, progressData.logs.length - CONFIG.MAX_STORED_LOGS);
+        }
     }
 
     function addDeleteRecord(data, reason) {
@@ -1148,11 +1077,7 @@
     // ========== 报告和导出 ==========
 
     function generateReport() {
-        if (!progressData.endTime && progressData.startTime) {
-            progressData.endTime = Date.now();
-        }
-
-        const totalTime = progressData.endTime ? progressData.endTime - progressData.startTime : 0;
+        const totalTime = progressData.startTime ? (progressData.endTime || Date.now()) - progressData.startTime : 0;
         const minutes = Math.floor(totalTime / 60000);
         const seconds = Math.floor((totalTime % 60000) / 1000);
 
@@ -1223,9 +1148,11 @@
 ║ 取关用户：${progressData.unfollowedUsers.toString().padEnd(20)} ║
 ╚══════════════════════════════════════╝
 
+执行状态：${progressData.currentStatus}
 执行时间：${new Date().toLocaleString()}
 脚本版本：${GM_info.script.version}
 ${deletedDetailsText}
+${unfollowDetailsText}
 
 注意事项：
 1. 删除的动态无法恢复，请谨慎操作
@@ -1234,8 +1161,6 @@ ${deletedDetailsText}
 `;
 
         console.log(report);
-        addProgressLog('执行完成，详细报告已生成', 'success');
-
         return report;
     }
 
@@ -1253,7 +1178,7 @@ ${deletedDetailsText}
 
                     GM_download({
                         url: dataUri,
-                        name: filename,
+                        name: `${String(GM_getValue('export-path', 'BiliDynamicCleaner')).replace(/[\\/:*?"<>|.]/g, '_') || 'BiliDynamicCleaner'}/${filename}`,
                         saveAs: true,
                         onload: function() {
                             console.log('报告导出成功');
@@ -1294,615 +1219,263 @@ ${deletedDetailsText}
 
     // ========== 核心功能 ==========
 
-    async function getDynamics(duid, offset, mode, input) {
-        if (isRunning) {
-            sendNotification('已有任务在执行中，请等待完成');
-            return;
-        }
 
+    async function getDynamics(duid, offset, mode, input) {
+        if (isRunning) return;
         isRunning = true;
         isPaused = false;
-        initProgressData(mode);
-        showProgressPanel();
-
+        runController = new AbortController();
+        runFailure = null;
+        mutationQueue = Promise.resolve();
+        lastMutationTime = 0;
+        lotteryCache.clear();
+        seenDynamics.clear();
+        const criteria = {
+            users: new Set(mode === 'user' ? input.split(',').map(user => user.trim()).filter(Boolean) : []),
+            days: mode === 'days_ago' ? Number(input) : null,
+            targetDate: mode === 'days_ago' ? getBeforeDate(Number(input)) : null,
+            unfollow: Boolean(GM_getValue('set-unfollow')),
+            autoPause: Boolean(GM_getValue('auto-pause'))
+        };
         try {
-            let page = 0;
-            let totalProcessed = 0;
-
-            progressData.currentStatus = '正在获取动态...';
-            updateProgressDisplay();
-            addProgressLog('开始获取动态数据', 'info');
-
-            while (isRunning) {
-                while (isPaused && isRunning) {
-                    await sleep(CONFIG.PAUSE_CHECK_INTERVAL);
-                }
-                if (!isRunning) break;
-
-                page++;
-                progressData.currentPage = page;
-                progressData.currentStatus = `正在处理第 ${page} 页...`;
+            initProgressData(mode);
+            showProgressPanel();
+            progressTimer = setInterval(updateProgressDisplay, 1000);
+            const seenOffsets = new Set();
+            let complete = false;
+            while (await waitUntilReady()) {
+                const cursor = String(offset ?? '');
+                if (seenOffsets.has(cursor)) throw new Error('分页游标重复，已终止以避免重复处理');
+                seenOffsets.add(cursor);
+                progressData.currentPage++;
+                progressData.currentStatus = `正在处理第 ${progressData.currentPage} 页...`;
                 updateProgressDisplay();
-
-                addProgressLog(`正在获取第 ${page} 页动态...`, 'info');
-
-                const result = await processDynamicPage(duid, offset, mode, input, page);
-
-                if (!result) break;
-
-                totalProcessed += result.processedItems;
-                progressData.processedItems = totalProcessed;
-                offset = result.nextOffset;
-
-                if (page % CONFIG.MEMORY_CLEANUP_INTERVAL === 0) {
-                    cleanupMemory();
-                }
-
-                if (GM_getValue('auto-pause') && page % 10 === 0) {
-                    togglePause();
-                    addProgressLog(`已处理 ${page} 页，自动暂停。请检查后点击"继续"按钮。`, 'warning');
-                    sendNotification(`已处理 ${page} 页，自动暂停`, 'warning');
-                }
-
-                if (!offset || !isRunning) {
-                    if (!isRunning) {
-                        progressData.currentStatus = '已停止';
-                        addProgressLog('用户手动停止了处理', 'warning');
-                    } else {
-                        progressData.currentStatus = '处理完成';
-                        addProgressLog('所有动态处理完成！', 'success');
-                    }
-                    updateProgressDisplay();
-
-                    if (GM_getValue('set-unfollow') && isRunning) {
-                        await sleep(2000);
-                        await unfollowUser();
-                    }
-
-                    if (isRunning) {
-                        progressData.endTime = Date.now();
-                        generateReport();
-                    }
-
+                const result = await processDynamicPage(duid, cursor, mode, criteria, progressData.currentPage);
+                if (!isTaskActive()) break;
+                if (!result.hasMore) {
+                    complete = true;
                     break;
                 }
-
+                if (!result.nextOffset || seenOffsets.has(result.nextOffset)) throw new Error('分页未返回新的游标，已终止');
+                offset = result.nextOffset;
+                if (criteria.autoPause && progressData.currentPage % 10 === 0 && !isPaused) {
+                    togglePause();
+                    addProgressLog(`已处理 ${progressData.currentPage} 页，自动暂停，请手动继续。`, 'warning');
+                }
                 await sleep(CONFIG.REQUEST_DELAY);
             }
-        } catch (error) {
-            console.error('获取动态失败:', error);
-            progressData.currentStatus = '处理出错';
-            addProgressLog('处理过程中出错: ' + error.message, 'error');
-            updateProgressDisplay();
-            sendNotification('处理动态过程中出错: ' + error.message, 'error');
-        } finally {
-            isRunning = false;
-        }
-    }
-
-    async function processDynamicPage(duid, offset, mode, input, pageNum) {
-        const dynamics_api = `https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?offset=${offset}&host_mid=${duid}`;
-
-        try {
-            const response = await axios({
-                url: dynamics_api,
-                withCredentials: true,
-                timeout: 10000,
-                headers: {
-                    'Accept': 'application/json, text/plain, */*'
-                }
-            });
-
-            if (response.data.code === 0) {
-                let items_list = response.data.data.items;
-                if (!items_list || items_list.length === 0) {
-                    addProgressLog(`第 ${pageNum} 页没有更多动态`, 'info');
-                    return null;
-                }
-
-                addProgressLog(`第 ${pageNum} 页获取到 ${items_list.length} 条动态`, 'info');
-
-                const batches = [];
-                for (let i = 0; i < items_list.length; i += CONFIG.BATCH_SIZE) {
-                    batches.push(items_list.slice(i, i + CONFIG.BATCH_SIZE));
-                }
-
-                let pageProcessedItems = 0;
-                let pageDeletedItems = 0;
-
-                for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
-                    if (!isRunning) break;
-                    if (isPaused) {
-                        await sleep(CONFIG.PAUSE_CHECK_INTERVAL);
-                        batchIndex--;
-                        continue;
-                    }
-
-                    const batch = batches[batchIndex];
-                    progressData.currentStatus = `处理第 ${pageNum} 页, 第 ${batchIndex + 1} 批`;
+            if (complete && isTaskActive()) {
+                if (criteria.unfollow) {
+                    progressData.currentStatus = '正在取关用户...';
                     updateProgressDisplay();
-
-                    const batchResult = await processDynamicBatch(batch, mode, input);
-                    pageProcessedItems += batchResult.processed;
-                    pageDeletedItems += batchResult.deleted;
-
-                    if (batchIndex < batches.length - 1 && isRunning && !isPaused) {
-                        await sleep(1000);
-                    }
+                    await unfollowUser();
                 }
-
-                addProgressLog(`第 ${pageNum} 页完成: 处理 ${pageProcessedItems} 条, 删除 ${pageDeletedItems} 条`, 'info');
-
-                return {
-                    processedItems: pageProcessedItems,
-                    nextOffset: response.data.data.offset
-                };
-            } else {
-                if (response.data.code === -352) {
-                    const key = `page_${pageNum}`;
-                    retryCounts[key] = (retryCounts[key] || 0) + 1;
-
-                    if (retryCounts[key] <= CONFIG.MAX_RETRIES) {
-                        addProgressLog(`第 ${pageNum} 页遇到频率限制，${CONFIG.RETRY_DELAY/1000}秒后重试 (${retryCounts[key]}/${CONFIG.MAX_RETRIES})`, 'warning');
-                        await sleep(CONFIG.RETRY_DELAY);
-                        return processDynamicPage(duid, offset, mode, input, pageNum);
-                    } else {
-                        addProgressLog(`第 ${pageNum} 页已达到最大重试次数，跳过此页`, 'error');
-                        return {
-                            processedItems: 0,
-                            nextOffset: response.data.data.offset || offset
-                        };
-                    }
-                } else {
-                    addProgressLog(`获取动态失败：${response.data.message} (code: ${response.data.code})`, 'error');
-                    return null;
+                if (isTaskActive()) {
+                    progressData.currentStatus = '处理完成';
+                    addProgressLog('所有动态处理完成！', 'success');
+                    sendNotification('动态清理完成', 'success');
                 }
             }
         } catch (error) {
-            addProgressLog(`处理第 ${pageNum} 页动态失败: ${error.message}`, 'error');
-
-            if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-                const key = `page_${pageNum}_timeout`;
-                retryCounts[key] = (retryCounts[key] || 0) + 1;
-
-                if (retryCounts[key] <= CONFIG.MAX_RETRIES) {
-                    addProgressLog(`第 ${pageNum} 页请求超时，${CONFIG.RETRY_DELAY/1000}秒后重试`, 'warning');
-                    await sleep(CONFIG.RETRY_DELAY);
-                    return processDynamicPage(duid, offset, mode, input, pageNum);
-                }
+            const failure = runFailure || (!isCancellation(error) ? error : null);
+            if (failure) {
+                progressData.currentStatus = '处理出错';
+                addProgressLog(`处理已终止: ${failure.message}`, 'error');
+                sendNotification(`处理已终止: ${failure.message}`, 'error');
             }
-
-            return null;
+        } finally {
+            await mutationQueue;
+            clearInterval(progressTimer);
+            progressTimer = null;
+            if (runFailure) progressData.currentStatus = '处理出错';
+            else if (runController.signal.aborted) progressData.currentStatus = '已停止';
+            progressData.endTime = Date.now();
+            isRunning = false;
+            isPaused = false;
+            lotteryCache.clear();
+            seenDynamics.clear();
+            updateProgressDisplay();
+            const pauseBtn = document.querySelector('.pause-btn');
+            if (pauseBtn) pauseBtn.textContent = '⏸️ 暂停';
         }
     }
 
-    async function processDynamicBatch(batch, mode, input) {
-        const promises = batch.map((data, index) =>
-            processSingleDynamic(data, mode, input, index)
-        );
-
-        const results = await Promise.allSettled(promises);
-
-        let processed = 0;
-        let deleted = 0;
-
-        results.forEach(result => {
-            if (result.status === 'fulfilled') {
-                processed++;
-                if (result.value) deleted++;
-            }
+    async function processDynamicPage(duid, offset, mode, criteria, pageNum) {
+        const body = await requestWithRetry({
+            url: 'https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space',
+            params: { offset, host_mid: duid }
         });
-
-        const failures = results.filter(r => r.status === 'rejected').length;
-
-        if (processed > 0 || failures > 0) {
-            addProgressLog(`批次处理完成: 处理 ${processed} 条, 删除 ${deleted} 条, 失败 ${failures} 条`,
-                          failures > 0 ? 'warning' : 'success');
+        if (!body.data) throw new Error(`第 ${pageNum} 页数据格式无效`);
+        const noMore = [false, 0, '0'].includes(body.data.has_more);
+        const items = body.data.items == null && noMore ? [] : body.data.items;
+        if (!Array.isArray(items)) throw new Error(`第 ${pageNum} 页动态列表格式无效`);
+        if (body.data.has_more !== undefined && ![true, false, 1, 0, '1', '0'].includes(body.data.has_more)) {
+            throw new Error(`第 ${pageNum} 页分页标记无效`);
         }
-
-        return {
-            processed: processed,
-            deleted: deleted,
-            failures: failures
-        };
+        const nextOffset = String(body.data.offset ?? '');
+        const hasMore = body.data.has_more === undefined ? Boolean(nextOffset && items.length) :
+            [true, 1, '1'].includes(body.data.has_more);
+        addProgressLog(`第 ${pageNum} 页获取到 ${items.length} 条动态`, 'info');
+        for (let i = 0; i < items.length; i += CONFIG.BATCH_SIZE) {
+            if (!await waitUntilReady()) break;
+            progressData.currentStatus = `处理第 ${pageNum} 页, 第 ${Math.floor(i / CONFIG.BATCH_SIZE) + 1} 批`;
+            updateProgressDisplay();
+            await processDynamicBatch(items.slice(i, i + CONFIG.BATCH_SIZE), mode, criteria);
+        }
+        return { nextOffset, hasMore };
     }
 
-    async function processSingleDynamic(data, mode, input, index) {
+    async function processDynamicBatch(batch, mode, criteria) {
+        const items = batch.filter(data => {
+            const id = data?.id_str;
+            if (!id || seenDynamics.has(String(id))) return false;
+            seenDynamics.add(String(id));
+            return true;
+        });
+        const results = await Promise.allSettled(items.map(data => processSingleDynamic(data, mode, criteria)));
+        const processed = results.filter(result => result.status === 'fulfilled').length;
+        const deleted = results.filter(result => result.status === 'fulfilled' && result.value).length;
+        const failures = results.filter(result => result.status === 'rejected' && !isCancellation(result.reason));
+        progressData.processedItems += processed + failures.length;
+        updateProgressDisplay();
+        if (runFailure) throw runFailure;
+        if (isTaskActive() && items.length) addProgressLog(`批次完成: 处理 ${processed} 条, 删除 ${deleted} 条, 失败 ${failures.length} 条`, failures.length ? 'warning' : 'info');
+        return { processed, deleted, failures: failures.length };
+    }
+
+    async function processSingleDynamic(data, mode, criteria) {
+        if (!await waitUntilReady()) throw cancellationError();
         const dynamicId = data.id_str;
-        console.log(`处理动态 ${index} (ID: ${dynamicId}):`, {
-            id_str: dynamicId,
-            type: data.type,
-            has_orig: !!data.orig,
-            orig_id_str: data.orig?.id_str,
-            data_keys: Object.keys(data)
-        });
-
-        if (!data.orig && data.type !== 'DYNAMIC_TYPE_FORWARD') {
-            addProgressLog(`不是转发动态，跳过`, 'info', dynamicId);
-            return false;
-        }
-
-        try {
-            if (mode === 'auto') {
-                if (data.orig.id_str == null) {
-                    addProgressLog(`源动态已被删除，执行删除`, 'info', dynamicId);
-                    const result = await deleteDynamic(data, '源动态已被删除');
-                    if (result) {
-                        progressData.deletedItems++;
-                        updateProgressDisplay();
-                    }
-                    return result;
-                } else {
-                    const lotteryResult = await checkLotteryStatus(data.orig.id_str, index);
-
-                    if (lotteryResult.success) {
-                        if (lotteryResult.isLottery && lotteryResult.status === 2) {
-                            addProgressLog(`源动态已开奖，执行删除`, 'info', dynamicId);
-                            const result = await deleteDynamic(data, `源动态已开奖`);
-                            if (result) {
-                                progressData.deletedItems++;
-                                updateProgressDisplay();
-
-                                if (GM_getValue('set-unfollow') && data.orig.modules.module_author.following) {
-                                    saveUnfollowUser(data);
-                                }
-                            }
-                            return result;
-                        } else if (!lotteryResult.isLottery) {
-                            addProgressLog(`源动态不是抽奖动态，跳过`, 'info', dynamicId);
-                            return false;
-                        } else {
-                            const statusText = lotteryResult.status === 0 ? '未开奖' :
-                                             lotteryResult.status === 1 ? '开奖中' :
-                                             `状态${lotteryResult.status}`;
-                            addProgressLog(`源动态${statusText}，跳过删除`, 'info', dynamicId);
-                            return false;
-                        }
-                    } else {
-                        addProgressLog(`抽奖API查询失败（重试${lotteryResult.retries || 0}次后），错误代码: ${lotteryResult.error?.code || '未知'}, 跳过删除`, 'error', dynamicId);
-                        return false;
-                    }
-                }
-            }
-
-            if (mode === 'user') {
-                const users = input.split(',').map(u => u.trim());
-                const authorName = data.orig.modules.module_author.name;
-                const authorId = data.orig.modules.module_author.mid.toString();
-
-                if (users.includes(authorName) || users.includes(authorId)) {
-                    addProgressLog(`匹配到指定用户 ${authorName}，执行删除`, 'info', dynamicId);
-                    const result = await deleteDynamic(data, `指定用户: ${authorName}`);
-                    if (result) {
-                        progressData.deletedItems++;
-                        updateProgressDisplay();
-
-                        if (GM_getValue('set-unfollow') && data.orig.modules.module_author.following) {
-                            saveUnfollowUser(data);
-                        }
-                    }
-                    return result;
-                }
-            }
-
+        // 删除边界只允许明确标记为转发的动态。
+        if (!['DYNAMIC_TYPE_FORWARD', 'FORWARD'].includes(data.type)) return false;
+        const original = data.orig;
+        const author = original?.modules?.module_author;
+        let reason;
+        if (mode === 'user') {
+            if (!author || !criteria.users.has(author.name) && !criteria.users.has(String(author.mid))) return false;
+            reason = `指定用户: ${author.name || author.mid}`;
+        } else {
             if (mode === 'days_ago') {
-                const days = parseInt(input);
-                if (isNaN(days) || days <= 0) {
-                    addProgressLog(`天数输入无效: ${input}`, 'error', dynamicId);
+                const date = getForwardDynamicDate(data);
+                if (!date.success) {
+                    addProgressLog('转发日期缺失或无效，跳过', 'warning', dynamicId);
                     return false;
                 }
-
-                addProgressLog(`开始获取转发动态日期，最多重试3次...`, 'info', dynamicId);
-                const forwardDateResult = await getForwardDynamicDateWithRetry(data, dynamicId, 3);
-
-                if (!forwardDateResult.success) {
-                    addProgressLog(`获取转发动态日期失败，已达到最大重试次数，跳过此动态`, 'error', dynamicId);
-                    return false;
-                }
-
-                const dyn_timestamp = forwardDateResult.timestamp;
-                const dyn_date = forwardDateResult.date;
-                const target_date = getBeforeDate(days);
-
-                console.log(`动态 ${dynamicId}: 转发日期=${dyn_date}, 目标日期=${target_date}, 重试次数=${forwardDateResult.retries}`);
-                addProgressLog(`转发日期: ${dyn_date}, 目标日期: ${target_date} (${days}天前), 重试次数: ${forwardDateResult.retries}`, 'info', dynamicId);
-
-                if (dyn_date && dyn_date <= target_date) {
-                    addProgressLog(`满足日期条件 (${dyn_date} <= ${target_date})`, 'info', dynamicId);
-
-                    if (data.orig.id_str) {
-                        const lotteryResult = await checkLotteryStatus(data.orig.id_str, index);
-
-                        if (lotteryResult.success) {
-                            if (lotteryResult.isLottery) {
-                                if (lotteryResult.status === 2) {
-                                    addProgressLog(`满足日期条件且已开奖，执行删除`, 'info', dynamicId);
-                                    const result = await deleteDynamic(data, `日期筛选(${days}天前)且已开奖`);
-                                    if (result) {
-                                        progressData.deletedItems++;
-                                        updateProgressDisplay();
-                                        if (GM_getValue('set-unfollow') && data.orig.modules.module_author.following) {
-                                            saveUnfollowUser(data);
-                                        }
-                                    }
-                                    return result;
-                                } else {
-                                    const statusText = lotteryResult.status === 0 ? '未开奖' :
-                                                     lotteryResult.status === 1 ? '开奖中' :
-                                                     `状态${lotteryResult.status}`;
-                                    addProgressLog(`满足日期条件但${statusText}，跳过删除`, 'info', dynamicId);
-                                    return false;
-                                }
-                            } else {
-                                addProgressLog(`满足日期条件（非抽奖动态），执行删除`, 'info', dynamicId);
-                                const result = await deleteDynamic(data, `日期筛选(${days}天前)的非抽奖动态`);
-                                if (result) {
-                                    progressData.deletedItems++;
-                                    updateProgressDisplay();
-                                    if (GM_getValue('set-unfollow') && data.orig.modules.module_author.following) {
-                                        saveUnfollowUser(data);
-                                    }
-                                }
-                                return result;
-                            }
-                        } else {
-                            addProgressLog(`满足日期条件但抽奖API查询失败（重试${lotteryResult.retries || 0}次后），错误代码: ${lotteryResult.error?.code || '未知'}，跳过删除`, 'error', dynamicId);
-                            return false;
-                        }
-                    } else {
-                        addProgressLog(`满足日期条件（源动态已被删除），执行删除`, 'info', dynamicId);
-                        const result = await deleteDynamic(data, `日期筛选(${days}天前)的已删除源动态`);
-                        if (result) {
-                            progressData.deletedItems++;
-                            updateProgressDisplay();
-                            if (GM_getValue('set-unfollow') && data.orig && data.orig.modules && data.orig.modules.module_author && data.orig.modules.module_author.following) {
-                                saveUnfollowUser(data);
-                            }
-                        }
-                        return result;
-                    }
-                }
-                addProgressLog(`不满足日期条件（${dyn_date} > ${target_date}），跳过`, 'info', dynamicId);
-                return false;
+                if (date.date > criteria.targetDate) return false;
             }
-        } catch (error) {
-            addProgressLog(`处理失败: ${error.message}`, 'error', dynamicId);
-            return false;
+            // 原动态缺失或占位对象没有ID，均按已删除的源动态处理。
+            if (!original?.id_str) {
+                reason = mode === 'auto' ? '源动态已被删除' : `日期筛选(${criteria.days}天前)的已删除源动态`;
+            } else {
+                const lottery = await checkLotteryStatus(original.id_str);
+                if (!lottery.success) {
+                    addProgressLog(`抽奖状态查询失败，跳过: ${lottery.error.message}`, 'error', dynamicId);
+                    return false;
+                }
+                if (lottery.isLottery && lottery.status !== 2) return false;
+                if (mode === 'auto' && !lottery.isLottery) return false;
+                reason = mode === 'auto' ? '源动态已开奖' :
+                    `日期筛选(${criteria.days}天前)的${lottery.isLottery ? '已开奖' : '非抽奖'}动态`;
+            }
         }
-
-        addProgressLog(`不符合任何删除条件，跳过`, 'info', dynamicId);
-        return false;
+        const deleted = await deleteDynamic(data, reason);
+        if (deleted) {
+            progressData.deletedItems++;
+            if (criteria.unfollow && [true, 1, '1'].includes(author?.following)) saveUnfollowUser(data);
+            updateProgressDisplay();
+        }
+        return deleted;
     }
 
     async function deleteDynamic(item, reason) {
+        if (!await waitUntilReady()) throw cancellationError();
         const csrf = getCSRFToken();
         if (!csrf) {
-            addProgressLog('未找到CSRF token，请重新登录。', 'error', item.id_str);
-            return false;
+            const error = new Error('CSRF token缺失，请重新登录');
+            error.fatal = true;
+            runFailure = error;
+            runController.abort();
+            throw error;
         }
-
-        const delete_api = `https://api.bilibili.com/x/dynamic/feed/operate/remove?platform=web&csrf=${csrf}`;
-        const re_id_str = item.id_str;
-
-        if (!re_id_str) {
-            addProgressLog('动态ID为空，无法删除', 'error');
-            return false;
-        }
-
-        // 动态类型判断 - 修复逻辑：使用当前动态的类型，不再使用源动态的类型
-        let dyn_type = mapDynamicType(item.type);
-
-        const requestBody = {
-            dyn_id_str: re_id_str,
-            dyn_type: dyn_type,
-            rid_str: re_id_str
-        };
-
-        addProgressLog(`删除请求参数: 动态ID=${re_id_str}, 类型=${dyn_type} (原类型: ${item.type})`, 'info', re_id_str);
-
-        let retries = 0;
-        const maxRetries = 3;
-
-        while (retries < maxRetries) {
-            try {
-                addProgressLog(`正在删除动态 (尝试 ${retries + 1}/${maxRetries})`, 'info', re_id_str);
-
-                const response = await axios({
-                    method: 'post',
-                    url: delete_api,
-                    withCredentials: true,
-                    data: JSON.stringify(requestBody),
-                    timeout: 10000,
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Accept': 'application/json, text/plain, */*'
-                    }
-                });
-
-                console.log(`删除API响应:`, {
-                    code: response.data.code,
-                    message: response.data.message,
-                    data: response.data.data
-                });
-
-                const successCodes = [0, '0'];
-                if (successCodes.includes(response.data.code)) {
-                    addProgressLog(`删除成功 (API返回: ${response.data.code})`, 'success', re_id_str);
-                    addDeleteRecord(item, reason);
-                    return true;
-                } else if (response.data.code === -403) {
-                    addProgressLog('CSRF token失效，请刷新页面后重试', 'error', re_id_str);
-                    break;
-                } else if (response.data.code === -404) {
-                    addProgressLog(`动态可能已被删除`, 'warning', re_id_str);
-                    addDeleteRecord(item, `${reason} (API返回404)`);
-                    return true;
-                } else if (response.data.code === 4128002) {
-                    addProgressLog(`操作频繁，等待后重试`, 'warning', re_id_str);
-                    retries++;
-                    await sleep(5000 * (retries + 1));
-                    continue;
-                } else {
-                    addProgressLog(`删除失败: ${response.data.message || '未知错误'} (code: ${response.data.code})`, 'error', re_id_str);
-                    retries++;
-                    await sleep(2000 * (retries + 1));
-                }
-            } catch (error) {
-                addProgressLog(`删除请求失败: ${error.message} (重试 ${retries + 1}/${maxRetries})`, 'error', re_id_str);
-                retries++;
-                await sleep(2000 * (retries + 1));
+        try {
+            const body = await requestWithRetry({
+                method: 'post',
+                url: 'https://api.bilibili.com/x/dynamic/feed/operate/remove',
+                params: { platform: 'web', csrf },
+                data: { dyn_id_str: item.id_str, dyn_type: 1, rid_str: item.id_str },
+                headers: { 'Content-Type': 'application/json' }
+            }, CONFIG.MAX_RETRIES, true, [0, -404]);
+            if (Number(body.code) === -404) {
+                addProgressLog('动态已不存在，不计入本次删除，也不添加取关', 'warning', item.id_str);
+                return false;
             }
+            addDeleteRecord(item, reason);
+            return true;
+        } catch (error) {
+            if (isCancellation(error) || error.fatal) throw error;
+            addProgressLog(`删除失败: ${error.message}`, 'error', item.id_str);
+            throw error;
         }
-
-        addProgressLog(`动态删除失败，已达到最大重试次数`, 'error', re_id_str);
-        return false;
     }
 
     function saveUnfollowUser(data) {
-        const unfollow_arr = GM_getValue('unfollow-list');
-        const uid = data.orig.modules.module_author.mid.toString();
-        const name = data.orig.modules.module_author.name;
-
-        const exists = unfollow_arr.some(item => (typeof item === 'object' ? item.uid : item) === uid);
-        if (!exists) {
-          unfollow_arr.push({ uid, name }); // 存储对象
-          GM_setValue('unfollow-list', unfollow_arr);
-          addProgressLog(`添加到取关列表: ${name} (${uid})`, 'info');
+        const author = data.orig?.modules?.module_author;
+        const uid = String(author?.mid ?? '');
+        if (!/^[1-9]\d*$/.test(uid)) return;
+        const users = getUnfollowList();
+        if (!users.some(user => user.uid === uid)) {
+            users.push({ uid, name: String(author.name || uid) });
+            GM_setValue('unfollow-list', users);
         }
     }
 
     async function unfollowUser() {
-        const unfollow_api = 'https://api.bilibili.com/x/relation/modify';
-        const unfollow_list = GM_getValue('unfollow-list');
-
-        if (unfollow_list.length === 0) {
-            addProgressLog('没有需要取关的用户。', 'info');
-            return;
-        }
-
-        addProgressLog(`开始取关 ${unfollow_list.length} 个用户...`, 'info');
-
-        let completed = 0;
-        let failed = [];
-
-        for (let i = 0; i < unfollow_list.length; i++) {
-            if (!isRunning) break;
-            if (isPaused) {
-                await sleep(CONFIG.PAUSE_CHECK_INTERVAL);
-                i--;
-                continue;
-            }
-
-            const user = unfollow_list[i];
-            const uid = user.uid;
-            const name = user.name;
-
+        const users = getUnfollowList();
+        GM_setValue('unfollow-list', users);
+        if (!users.length) return;
+        addProgressLog(`开始取关 ${users.length} 个用户...`, 'info');
+        for (const user of users) {
+            if (!await waitUntilReady()) break;
             try {
                 const csrf = getCSRFToken();
                 if (!csrf) {
-                    addProgressLog(`未找到CSRF token，取关失败: ${name} (${uid})`, 'error');
-                    progressData.unfollowFailedDetails.push({
-                        uid: uid,
-                        name: name,
-                        timestamp: new Date().toLocaleString(),
-                        reason: 'CSRF token 缺失，请重新登录'
-                    });
-                    failed.push({ uid, name });
-                    continue;
+                    const error = new Error('CSRF token缺失，请重新登录');
+                    error.fatal = true;
+                    runFailure = error;
+                    runController.abort();
+                    throw error;
                 }
-
-                addProgressLog(`正在取关 ${name} (${uid})...`, 'info');
-
-                const response = await axios({
+                await requestWithRetry({
                     method: 'post',
-                    url: unfollow_api,
-                    withCredentials: true,
-                    data: new URLSearchParams({
-                        fid: uid,
-                        act: '2',
-                        re_src: '11',
-                        spmid: '333.999.0.0',
-                        csrf: csrf
-                    }),
-                    timeout: 10000,
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                        'Accept': 'application/json, text/plain, */*'
-                    }
-                });
-
-                const successCodes = [0, '0'];
-                if (successCodes.includes(response.data.code)) {
-                    completed++;
-                    progressData.unfollowedUsers = completed;
-                    progressData.unfollowedDetails.push({
-                        uid: uid,
-                        name: name,
-                        timestamp: new Date().toLocaleString()
-                    });
-                    addProgressLog(`取关成功: ${name} (${uid})`, 'success');
-                    updateProgressDisplay();
-                } else {
-                    const errorMsg = response.data.message || '未知错误';
-                    addProgressLog(`取关失败: ${errorMsg} (code: ${response.data.code}) - ${name} (${uid})`, 'error');
-                    progressData.unfollowFailedDetails.push({
-                        uid: uid,
-                        name: name,
-                        timestamp: new Date().toLocaleString(),
-                        reason: `API返回错误: ${errorMsg} (code: ${response.data.code})`
-                    });
-                    failed.push({ uid, name });
-                }
+                    url: 'https://api.bilibili.com/x/relation/modify',
+                    data: new URLSearchParams({ fid: user.uid, act: '2', re_src: '11', spmid: '333.999.0.0', csrf }),
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+                }, CONFIG.MAX_RETRIES, true);
+                // 每次成功即保存；失败及尚未执行的用户留在队列。
+                GM_setValue('unfollow-list', getUnfollowList().filter(item => item.uid !== user.uid));
+                progressData.unfollowedUsers++;
+                progressData.unfollowedDetails.push({ ...user, timestamp: new Date().toLocaleString() });
+                addProgressLog(`取关成功: ${user.name} (${user.uid})`, 'success');
+                updateProgressDisplay();
             } catch (error) {
-                addProgressLog(`取关请求失败: ${error.message} - ${name} (${uid})`, 'error');
-                progressData.unfollowFailedDetails.push({
-                    uid: uid,
-                    name: name,
-                    timestamp: new Date().toLocaleString(),
-                    reason: `请求异常: ${error.message}`
-                });
-                failed.push({ uid, name });
-            }
-
-            if (i < unfollow_list.length - 1 && isRunning && !isPaused) {
-                await sleep(3000);
+                if (isCancellation(error)) break;
+                progressData.unfollowFailedDetails.push({ ...user, timestamp: new Date().toLocaleString(), reason: error.message });
+                if (error.fatal) throw error;
+                addProgressLog(`取关失败，已保留待重试: ${user.name} (${user.uid}) - ${error.message}`, 'error');
             }
         }
-
-        GM_setValue('unfollow-list', []);
-
-        let message = `取关操作完成。成功: ${completed}, 失败: ${failed.length}`;
-        if (failed.length > 0) {
-            message += `\n失败的用户ID: ${failed.join(', ')}`;
-            addProgressLog(message, 'warning');
-        } else {
-            addProgressLog(message, 'success');
-        }
+        addProgressLog(`取关结束，待取关列表剩余 ${getUnfollowList().length} 个用户`, 'info');
     }
 
-    // ========== 内存和状态管理 ==========
-
-    function cleanupMemory() {
-        if (Object.keys(retryCounts).length > 100) {
-            const oldKeys = Object.keys(retryCounts).slice(0, 50);
-            oldKeys.forEach(key => delete retryCounts[key]);
-        }
-    }
 
     function stopProcessing() {
-        if (isRunning) {
-            isRunning = false;
-            isPaused = false;
-            progressData.currentStatus = '已停止';
-            updateProgressDisplay();
-            addProgressLog('用户手动停止了处理', 'warning');
-            sendNotification('处理已停止', 'warning');
-
-            const pauseBtn = document.querySelector('.pause-btn');
-            if (pauseBtn) {
-                pauseBtn.innerHTML = '⏸️ 暂停';
-            }
-        }
+        if (!isTaskActive()) return;
+        runController.abort();
+        isPaused = false;
+        progressData.currentStatus = '正在停止...';
+        updateProgressDisplay();
+        addProgressLog('用户停止了处理，正在取消请求和等待', 'warning');
+        sendNotification('已请求停止处理', 'warning');
     }
 
     function sendNotification(msg, type = 'info') {
@@ -1937,9 +1510,10 @@ ${deletedDetailsText}
             return false;
         }
 
+        if (!['auto', 'user', 'days_ago'].includes(mode)) return false;
         const duid = getUserID();
 
-        if (!duid) {
+        if (!duid || !getCSRFToken()) {
             sendNotification('未检测到登录状态，请先登录B站。', 'error');
             return false;
         }
@@ -1952,12 +1526,17 @@ ${deletedDetailsText}
                 sendNotification('没有输入内容！', 'warning');
                 return false;
             }
-            input = input.trim();
+            input = input.split(',').map(user => user.trim()).filter(Boolean).join(',');
+            if (!input) {
+                sendNotification('请输入至少一个用户名或UID', 'warning');
+                return false;
+            }
         }
 
         if (mode === 'days_ago') {
-            input = prompt('请输入想要删除多少天前的动态 (正整数):\n例如: 30 (删除30天前的动态)\n\n注意：会尝试获取您转发该动态的日期，如果获取失败会重试3次，仍然失败则跳过该动态。抽奖API失败会重试' + getLotteryApiRetries() + '次。');
-            if (!input || isNaN(parseInt(input)) || parseInt(input) <= 0) {
+            input = prompt('请输入想要删除多少天前的动态 (正整数):\n例如: 30 (删除30天前的动态)\n\n注意：会尝试获取您转发该动态的日期，日期字段无效时会跳过该动态。抽奖API失败会重试' + getLotteryApiRetries() + '次。');
+            input = input?.trim();
+            if (!input || !/^[1-9]\d*$/.test(input) || !Number.isSafeInteger(Number(input)) || !Number.isFinite(new Date(Date.now() - Number(input) * 86400000).getTime())) {
                 sendNotification('输入错误！请输入正整数。', 'error');
                 return false;
             }
@@ -1967,7 +1546,7 @@ ${deletedDetailsText}
         let warningMsg = `抽奖API重试次数: ${getLotteryApiRetries()} 次`;
 
         if (mode === 'days_ago') {
-            warningMsg += `\n\n日期筛选说明: 将判断您转发该动态的日期，如果获取失败会重试3次，仍然失败则跳过该动态。`;
+            warningMsg += `\n\n日期筛选说明: 将判断您转发该动态的日期，日期字段无效时会跳过该动态。`;
         }
 
         warningMsg += '\n\n注意：这将删除符合条件的转发动态，操作不可撤销！';
@@ -1980,8 +1559,6 @@ ${deletedDetailsText}
 
         console.log('启动任务前显示进度面板');
         showProgressPanel();
-
-        retryCounts = {};
 
         await getDynamics(duid, '', mode, input);
         return true;
@@ -2009,7 +1586,7 @@ ${deletedDetailsText}
         }, 'S');
 
         GM_registerMenuCommand('📋 查看取关列表', () => {
-            let unfollow_list = GM_getValue('unfollow-list');
+            let unfollow_list = getUnfollowList();
             if (unfollow_list.length === 0) {
                 sendNotification('取关列表为空。', 'info');
             } else {
@@ -2097,7 +1674,7 @@ ${deletedDetailsText}
                         <div class="setting-item">
                             <label for="export-path">
                                 导出路径
-                                <div class="help-text">报告导出保存的文件夹名称</div>
+                                <div class="help-text">GM_download保存的子文件夹名称（取决于扩展权限）</div>
                             </label>
                             <input type="text" id="export-path" style="width: 120px; padding: 5px; border: 1px solid #ddd; border-radius: 4px;" />
                         </div>
@@ -2131,7 +1708,7 @@ ${deletedDetailsText}
         exportPathInput.value = GM_getValue('export-path');
         lotteryApiRetriesInput.value = getLotteryApiRetries();
 
-        const unfollowList = GM_getValue('unfollow-list');
+        const unfollowList = getUnfollowList();
         unfollowCountSpan.textContent = unfollowList.length;
 
         const closeBtn = main_window.querySelector('.setting-close');
@@ -2143,15 +1720,15 @@ ${deletedDetailsText}
         });
 
         saveBtn.addEventListener('click', () => {
-            GM_setValue('set-unfollow', unfollowCheckbox.checked);
-            GM_setValue('auto-pause', autoPauseCheckbox.checked);
-            GM_setValue('export-path', exportPathInput.value.trim() || 'BiliDynamicCleaner');
-
-            const retries = parseInt(lotteryApiRetriesInput.value, 10);
-            if (isNaN(retries) || retries < 0 || retries > 5) {
+            const retriesText = lotteryApiRetriesInput.value.trim();
+            const retries = Number(retriesText);
+            if (!retriesText || !Number.isInteger(retries) || retries < 0 || retries > 5) {
                 sendNotification('抽奖API重试次数必须为0-5之间的整数', 'error');
                 return;
             }
+            GM_setValue('set-unfollow', unfollowCheckbox.checked);
+            GM_setValue('auto-pause', autoPauseCheckbox.checked);
+            GM_setValue('export-path', exportPathInput.value.trim() || 'BiliDynamicCleaner');
             GM_setValue('lottery-api-retries', retries);
 
             sendNotification('设置已保存', 'success');
@@ -2159,6 +1736,10 @@ ${deletedDetailsText}
         });
 
         clearUnfollowBtn.addEventListener('click', () => {
+            if (isRunning) {
+                sendNotification('请等待任务结束后再清空取关列表', 'warning');
+                return;
+            }
             if (confirm('确定要清空取关列表吗？')) {
                 GM_setValue('unfollow-list', []);
                 unfollowCountSpan.textContent = '0';
@@ -2219,6 +1800,8 @@ ${deletedDetailsText}
 
         window.biliDynamicAutoDelLoaded = false;
         menuCommandsRegistered = false;
+        runController?.abort();
+        clearInterval(progressTimer);
         isRunning = false;
         isPaused = false;
     }
