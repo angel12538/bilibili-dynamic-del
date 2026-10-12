@@ -70,7 +70,7 @@ test('缺失源动态可删除，自发动态即使带orig也不删除，重复I
     const h = harness(config => config.method === 'post' ? { code: '0' } : feed([
         forward('1'), forward('1'), { ...forward('2', original('8')), type: 'DYNAMIC_TYPE_WORD' }
     ]));
-    await h.api.getDynamics('123', '', 'auto', '');
+    await h.api.getDynamics('123', '', 'auto', '30');
     assert.equal(h.calls.filter(call => call.method === 'post').length, 1);
     assert.equal(h.calls[1].data.dyn_id_str, '1');
     assert.equal(h.api.progress.deletedItems, 1);
@@ -85,7 +85,7 @@ test('相同源动态并发查询复用一次请求，字符串开奖状态可�
         if (config.url.includes('lottery_notice')) { await delay(5); return { code: 0, data: { status: '2' } }; }
         return feed([forward('1', original('9')), forward('2', original('9'))]);
     });
-    await h.api.getDynamics('123', '', 'auto', '');
+    await h.api.getDynamics('123', '', 'auto', '30');
     assert.equal(h.calls.filter(call => call.url.includes('lottery_notice')).length, 1);
     assert.equal(h.api.progress.deletedItems, 2);
 });
@@ -120,25 +120,25 @@ test('指定用户支持UID及姓名，源动态缺失不会崩溃', async () =>
 
 test('has_more为0时忽略残留offset并完成空页', async () => {
     const h = harness(() => feed([], 'still-present', 0));
-    await h.api.getDynamics('123', '', 'auto', '');
+    await h.api.getDynamics('123', '', 'auto', '30');
     assert.equal(h.calls.length, 1);
     assert.equal(h.api.progress.currentStatus, '处理完成');
 });
 
 test('重复分页游标终止任务，不重复请求', async () => {
     const h = harness(() => feed([], 'same', true));
-    await h.api.getDynamics('123', '', 'auto', '');
+    await h.api.getDynamics('123', '', 'auto', '30');
     assert.equal(h.calls.length, 2);
     assert.equal(h.api.progress.currentStatus, '处理出错');
 });
 
 test('末页缺失items可完成，非末页缺失items或未知分页标记报错', async () => {
     const empty = harness(() => ({ code: 0, data: { has_more: 0 } }));
-    await empty.api.getDynamics('123', '', 'auto', '');
+    await empty.api.getDynamics('123', '', 'auto', '30');
     assert.equal(empty.api.progress.currentStatus, '处理完成');
     for (const body of [{ has_more: 1 }, { items: [], has_more: 'unknown' }]) {
         const h = harness(() => ({ code: 0, data: body }));
-        await h.api.getDynamics('123', '', 'auto', '');
+        await h.api.getDynamics('123', '', 'auto', '30');
         assert.equal(h.api.progress.currentStatus, '处理出错');
         assert.equal(h.calls.length, 1);
     }
@@ -146,14 +146,14 @@ test('末页缺失items可完成，非末页缺失items或未知分页标记报�
 
 test('连续10页开启自动暂停时，末页直接完成', async () => {
     const h = harness((config, count) => feed([], String(count), count < 10), { 'auto-pause': true });
-    await h.api.getDynamics('123', '', 'auto', '');
+    await h.api.getDynamics('123', '', 'auto', '30');
     assert.equal(h.calls.length, 10);
     assert.equal(h.api.progress.currentStatus, '处理完成');
 });
 
 test('风控只有限重试，耗尽后终止而不是无限翻页', async () => {
     const h = harness(() => ({ code: -352 }));
-    await h.api.getDynamics('123', '', 'auto', '');
+    await h.api.getDynamics('123', '', 'auto', '30');
     assert.equal(h.calls.length, 3);
     assert.equal(h.api.progress.currentStatus, '处理出错');
 });
@@ -167,7 +167,7 @@ test('停止会取消在途请求、禁止队列删除及阻止旧任务未结�
             config.signal.addEventListener('abort', cancel, { once: true });
         });
     });
-    const run = h.api.getDynamics('123', '', 'auto', '');
+    const run = h.api.getDynamics('123', '', 'auto', '30');
     while (!cancel) await delay(1);
     h.api.stopProcessing();
     assert.equal(await h.api.start('auto'), false);
@@ -181,7 +181,7 @@ test('停止会取消在途请求、禁止队列删除及阻止旧任务未结�
 test('重试等待中停止，不再发送后续请求', async () => {
     const h = harness(() => { const error = new Error('Network Error'); error.code = 'ERR_NETWORK'; throw error; });
     h.api.CONFIG.RETRY_DELAY = 500;
-    const run = h.api.getDynamics('123', '', 'auto', '');
+    const run = h.api.getDynamics('123', '', 'auto', '30');
     while (!h.calls.length) await delay(1);
     h.api.stopProcessing();
     await run;
@@ -202,7 +202,7 @@ test('暂停后排队删除等待继续，写请求串行且有间隔', async ()
         return { code: 0 };
     });
     h.api.CONFIG.REQUEST_DELAY = 15;
-    const run = h.api.getDynamics('123', '', 'auto', '');
+    const run = h.api.getDynamics('123', '', 'auto', '30');
     await pauseReached;
     await delay(25);
     assert.equal(times.length, 1);
@@ -219,7 +219,7 @@ test('删除返回404不虚增删除统计，也不添加取关', async () => {
         if (config.url.includes('lottery_notice')) return { code: 0, data: { status: 2 } };
         return feed([forward('1', original('9'))]);
     }, { 'set-unfollow': true });
-    await h.api.getDynamics('123', '', 'auto', '');
+    await h.api.getDynamics('123', '', 'auto', '30');
     assert.equal(h.api.progress.deletedItems, 0);
     assert.equal(h.api.progress.deletedDetails.length, 0);
     assert.equal(h.api.getUnfollowList().length, 0);
@@ -230,7 +230,7 @@ test('取关兼容旧UID字符串，失败保留，成功移除并包含在报�
         if (!config.method) return feed([]);
         return { code: config.data.get('fid') === '1' ? -123 : 0 };
     }, { 'set-unfollow': true, 'unfollow-list': ['1', { uid: 2, name: '成功用户' }, '2', null] });
-    await h.api.getDynamics('123', '', 'auto', '');
+    await h.api.getDynamics('123', '', 'auto', '30');
     assert.deepEqual(JSON.parse(JSON.stringify(h.api.getUnfollowList())), [{ uid: '1', name: '1' }]);
     assert.equal(h.api.progress.unfollowedUsers, 1);
     assert.match(h.api.generateReport(), /成功用户/);
@@ -247,14 +247,14 @@ test('取关中停止保留当前和未处理用户', async () => {
             const error = new Error('canceled'); error.code = 'ERR_CANCELED'; reject(error);
         }, { once: true }));
     }, { 'set-unfollow': true, 'unfollow-list': ['1', '2'] });
-    const run = h.api.getDynamics('123', '', 'auto', '');
+    const run = h.api.getDynamics('123', '', 'auto', '30');
     await reached; h.api.stopProcessing(); await run;
     assert.equal(h.api.getUnfollowList().length, 2);
 });
 
 test('CSRF失效立即终止，不继续删除或取关', async () => {
     const h = harness(config => config.method === 'post' ? { code: -403 } : feed([forward('1'), forward('2')]));
-    await h.api.getDynamics('123', '', 'auto', '');
+    await h.api.getDynamics('123', '', 'auto', '30');
     assert.equal(h.calls.filter(call => call.method === 'post').length, 1);
     assert.equal(h.api.progress.currentStatus, '处理出错');
 });
@@ -290,8 +290,71 @@ test('日期输入必须是完整正整数，不接受小数或带后缀', async
     for (const value of ['3abc', '1.5', '0', '-1', '', '999999999999999999']) {
         h.context.prompt = () => value;
         assert.equal(await h.api.start('days_ago'), false);
+        assert.equal(await h.api.start('auto'), false);
     }
     h.context.prompt = () => ', ,';
     assert.equal(await h.api.start('user'), false);
     assert.equal(h.calls.length, 0);
+});
+
+test('自动判断先输入天数并确认截止日期，仅删除范围内已开奖或源已删除的转发', async () => {
+    let prompts = 0, confirmations = 0;
+    const h = harness(config => {
+        if (config.method === 'post') return { code: 0 };
+        if (config.url.includes('lottery_notice')) {
+            const id = config.params.business_id;
+            return id === '10' ? { code: -400 } : { code: 0, data: { status: id === '9' ? 2 : 1 } };
+        }
+        const cutoff = new Date(`${h.api.getBeforeDate(30)}T23:59:59`);
+        const recent = new Date(cutoff); recent.setDate(recent.getDate() + 1);
+        return feed([
+            forward('1', null, cutoff.getTime() / 1000),
+            forward('2', original('9')),
+            forward('3', null, recent.getTime() / 1000),
+            forward('4', original('10')),
+            forward('5', original('11')),
+            forward('6', null, '昨天')
+        ]);
+    });
+    h.context.prompt = message => {
+        prompts++;
+        assert.match(message, /清理多少天前/);
+        assert.equal(h.calls.length, 0);
+        return ' 30 ';
+    };
+    h.context.confirm = message => {
+        confirmations++;
+        assert.ok(message.includes(h.api.getBeforeDate(30)));
+        assert.match(message, /含当天/);
+        assert.match(message, /自动判断仅删除已开奖抽奖/);
+        assert.equal(h.calls.length, 0);
+        return true;
+    };
+    assert.equal(await h.api.start('auto'), true);
+    assert.equal(prompts, 1);
+    assert.equal(confirmations, 1);
+    assert.deepEqual(h.calls.filter(call => call.method === 'post').map(call => call.data.dyn_id_str), ['1', '2']);
+    assert.equal(h.api.progress.deletedItems, 2);
+});
+
+test('自动判断取消天数输入或最终确认时不发请求', async () => {
+    for (const cancelInput of [true, false]) {
+        let confirmations = 0;
+        const h = harness(() => { throw new Error('取消后不应发请求'); });
+        h.context.prompt = () => cancelInput ? null : '30';
+        h.context.confirm = () => { confirmations++; return false; };
+        assert.equal(await h.api.start('auto'), false);
+        assert.equal(h.calls.length, 0);
+        assert.equal(confirmations, cancelInput ? 0 : 1);
+        assert.equal(h.api.running, false);
+    }
+});
+
+test('缺少有效天数时自动判断不能绕过弹窗直接清理全部日期', async () => {
+    const h = harness(() => { throw new Error('无有效日期范围不应发请求'); });
+    for (const value of ['', null, 'invalid', '0']) {
+        assert.equal(await h.api.getDynamics('123', '', 'auto', value), false);
+    }
+    assert.equal(h.calls.length, 0);
+    assert.equal(h.api.running, false);
 });

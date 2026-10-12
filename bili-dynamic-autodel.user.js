@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站动态自动清理
 // @namespace    https://github.com/
-// @version      2026.10.12
+// @version      2026.10.12.1
 // @description  删除B站转发的已开奖动态和源动态已被删除的动态
 // @author       monSteRhhe
 // @match        http*://*.bilibili.com/*
@@ -130,6 +130,14 @@
                         (month < 10 ? ('0' + month) : month) + '-' +
                         (day < 10 ? ('0' + day) : day);
         return before_date;
+    }
+
+    function parseCleanupDays(input) {
+        const value = String(input ?? '').trim();
+        const days = Number(value);
+        if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(days) ||
+            !Number.isFinite(new Date(Date.now() - days * 86400000).getTime())) return null;
+        return days;
     }
 
     function timestampToDate(ts) {
@@ -1222,6 +1230,12 @@ ${unfollowDetailsText}
 
     async function getDynamics(duid, offset, mode, input) {
         if (isRunning) return;
+        const needsDate = mode === 'auto' || mode === 'days_ago';
+        const days = needsDate ? parseCleanupDays(input) : null;
+        if (needsDate && days === null) {
+            sendNotification('输入错误！请输入清理天数（正整数）。', 'error');
+            return false;
+        }
         isRunning = true;
         isPaused = false;
         runController = new AbortController();
@@ -1232,13 +1246,16 @@ ${unfollowDetailsText}
         seenDynamics.clear();
         const criteria = {
             users: new Set(mode === 'user' ? input.split(',').map(user => user.trim()).filter(Boolean) : []),
-            days: mode === 'days_ago' ? Number(input) : null,
-            targetDate: mode === 'days_ago' ? getBeforeDate(Number(input)) : null,
+            days,
+            targetDate: needsDate ? getBeforeDate(days) : null,
             unfollow: Boolean(GM_getValue('set-unfollow')),
             autoPause: Boolean(GM_getValue('auto-pause'))
         };
         try {
             initProgressData(mode);
+            if (criteria.targetDate) {
+                addProgressLog(`清理范围: ${criteria.targetDate}（含当天）及之前的转发动态 (${criteria.days}天前)`, 'info');
+            }
             showProgressPanel();
             progressTimer = setInterval(updateProgressDisplay, 1000);
             const seenOffsets = new Set();
@@ -1355,7 +1372,7 @@ ${unfollowDetailsText}
             if (!author || !criteria.users.has(author.name) && !criteria.users.has(String(author.mid))) return false;
             reason = `指定用户: ${author.name || author.mid}`;
         } else {
-            if (mode === 'days_ago') {
+            if (criteria.targetDate) {
                 const date = getForwardDynamicDate(data);
                 if (!date.success) {
                     addProgressLog('转发日期缺失或无效，跳过', 'warning', dynamicId);
@@ -1533,25 +1550,31 @@ ${unfollowDetailsText}
             }
         }
 
-        if (mode === 'days_ago') {
-            input = prompt('请输入想要删除多少天前的动态 (正整数):\n例如: 30 (删除30天前的动态)\n\n注意：会尝试获取您转发该动态的日期，日期字段无效时会跳过该动态。抽奖API失败会重试' + getLotteryApiRetries() + '次。');
-            input = input?.trim();
-            if (!input || !/^[1-9]\d*$/.test(input) || !Number.isSafeInteger(Number(input)) || !Number.isFinite(new Date(Date.now() - Number(input) * 86400000).getTime())) {
+        const needsDate = mode === 'auto' || mode === 'days_ago';
+        if (needsDate) {
+            const modeDescription = mode === 'auto' ? '仅删除已开奖抽奖和源动态已被删除的转发动态。' : '未开奖的互动抽奖会保留。';
+            input = prompt('请输入想要清理多少天前的转发动态（正整数）:\n例如: 30（仅处理30天前及更早的转发动态）\n\n' + modeDescription + '\n日期字段无效时跳过，抽奖API失败会重试' + getLotteryApiRetries() + '次。');
+            if (input === null) return false;
+            const days = parseCleanupDays(input);
+            if (days === null) {
                 sendNotification('输入错误！请输入正整数。', 'error');
                 return false;
             }
+            input = String(days);
         }
 
         // 直接构建警告信息，不再尝试获取动态总数
         let warningMsg = `抽奖API重试次数: ${getLotteryApiRetries()} 次`;
 
-        if (mode === 'days_ago') {
-            warningMsg += `\n\n日期筛选说明: 将判断您转发该动态的日期，日期字段无效时会跳过该动态。`;
+        if (needsDate) {
+            warningMsg += `\n\n清理范围: ${getBeforeDate(Number(input))}（含当天）及之前发布的转发动态 (${input}天前)。日期字段无效时跳过。`;
+            if (mode === 'auto') warningMsg += '\n自动判断仅删除已开奖抽奖和源动态已被删除的转发动态。';
         }
 
         warningMsg += '\n\n注意：这将删除符合条件的转发动态，操作不可撤销！';
 
-        if (!confirm(`确定要开始执行"${mode}"模式吗？\n\n${warningMsg}`)) {
+        const modeName = { auto: '自动判断', user: '指定用户', days_ago: '日期筛选' }[mode];
+        if (!confirm(`确定要开始执行“${modeName}”模式吗？\n\n${warningMsg}`)) {
             return false;
         }
 
